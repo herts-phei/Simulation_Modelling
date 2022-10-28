@@ -1,0 +1,301 @@
+---
+title: "Discrete Event Simulation in R"
+date: "`r Sys.Date()`"
+author: |
+  | Will Yuill
+  | Hertfordshire County Council Public Health
+  | Funded by JEIC Modelling Fellowship
+output:
+  rmdformats::robobook:
+    highlight: kate
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(simmer)
+library(simmer.bricks)
+library(simmer.plot)
+library(dplyr)
+library(ggplot2)
+require(gridExtra)
+library(stringr)
+library(knitr)
+```
+
+Discrete Event Simulation is a modelling method designed to optimise processes and improve movement through systems, for instance modelling the flow of patients through a hospital. A number of resources on DES modelling have been developed within the NHS to date. Many are contained on this [site](https://future.nhs.uk/connect.ti/GPsal/grouphome).
+
+## R packages for discrete event simulation modelling
+
+### Simmer
+
+`simmer` is a well-developed package making the development of DES model relatively straight-forward and will be the primary package used in this document. A large number of vignettes exist on the package pages (as well as [here](https://the-strategy-unit.github.io/des_simmer_workshop)), and these will not be exhaustively replicated however a number of domain relevant examples will be presented.
+
+### PathSimR
+
+`PathSimR` is a packaged developed within the NHS that aims to simply the process of building DES models through Shiny based user interface and the use of visualisations.
+
+### Other useful packages
+
+`processanimateR` provides a useful tool for creating animations showing how entities move through a system.
+
+## Components of a simmer DES model
+
+simmer models are built around the concept of a trajectory (i.e., an activity chain through which entities pass). In base simmer an action within a trajectory may be coded as below where a patient (the entity) is 'seized' by a nurse (the resource) to undertake an activity (e.g., a care process) for a given amount of time before releasing the entity, freeing up the resource.
+
+``` {.R}
+trajectory("patients' path") %>%
+  seize("nurse", 1) %>%
+  timeout(function() rnorm(1, 15)) %>%
+  release("nurse", 1)
+```
+
+We can however use the extension simmer.bricks to simplify this model which introduces the `visit` function which combines all of these steps into one function.
+
+``` {.R}
+trajectory("patients' path") %>%
+  visit("nurse", function() rnorm(1, 15))
+```
+
+Note that when part of the trajectory becomes more complex (for instance if there is a delayed release to allow for a resource to recover before it is used again) the base simmer solution may need to be reverted to, so it is important to be familiar with it.
+
+A trajectory has a number of components that record activities that occur as a trajectory is followed.
+
+### Resources
+
+As demonstrated above as entities move through the trajectory they interact with resources, utilising them for periods of time. Further parameters about the resource can be added, such as its capacity, and queue size limit.
+
+### Branching
+
+Branches allow different trajectory routes to be followed if, for instance, an entity needs a particular course of action such as a certain scan. Branches can also be used if activities are going on at the same time for instance a consultation and a test being processed in a lab.
+
+### Reneging and other behaviours
+
+A number of system behaviours that alter how entities move through the system as well as how they leave.
+
+-   **Reneging and balking:** Reneging refers to entities that leave before completion of the trajectory for instance if they wait too long in the queue. Balking is similar but occurs before the entity enters the queue, for instance a patient who sees the queue for A&E stretching out the door may simply leave.
+
+-   **Prioritisation:** In some cases, we may want certain entities (e.g., those critically ill) to move through the trajectory ahead of those who may have arrived earlier. Using prioritisation entities can be allowed to overtake other or even displace those using resources.
+
+-   **Interruptions:** We may wish to model interruptions to entities using resources. For instance, if modelling a procedure that required some equipment, we could model the time it takes for that equipment to be brought to the room. During this time both the resource (clinician) and entity (patient) are occupied but are not progressing with treatment.
+
+### Logging
+
+Using the `log` function to store messages of what activity is going on. This makes debugging easier.
+
+## Modelling a A&E department
+
+To demonstrate a basic DES model, we can create a model of patients attending A&E. In the model a patient arrives and then the following trajectory is followed:
+
+-   The patient is booked in by a receptionist. The system has one receptionist and each booking in process takes around 5 minutes (modelled as a distribution rather than constant).
+
+-   The patient is then triaged by a nurse. The system has two nurses, and each triage process takes around 15 minutes (again modelled as a distribution). The nurse has to write up these findings and consequently is unable to see another patient for 5 minutes after the former patient has left.
+
+-   Finally, the patient is seen by a doctor to discuss ongoing care. The system has two doctors, and this process takes around 25 minutes.
+
+We can then run this model by creating a generator which adds a new patient around every 5 minutes. We run the model for four hours.
+
+```{r, class.source = 'fold-show'}
+set.seed(42)
+
+# Create a simmer trajectory with the times taken for each action
+# Note for nurse we cannot use visit as there is a delayed release of resource
+patient <- trajectory("patients' path") %>%
+  visit("receptionist", function() rnorm(1, 5)) %>%
+  seize("nurse") %>%
+  timeout(function() rnorm(1, 15)) %>%
+  delayed_release("nurse", 5) %>% 
+  visit("doctor", function() rnorm(1, 25))
+
+# Create a simmer environment with the resources we have available
+env <- simmer("A&E Department") %>%
+  add_resource("receptionist", 1) %>%
+  add_resource("nurse", 2) %>%
+  add_resource("doctor", 2) %>%
+  add_generator("patient", patient, function() rexp(1, 1/5))
+
+# Run model for 4 hours (simmer does not have a time element. Our appointments are measured in minutes this is 4 * 60 minutes)
+env %>% run(4 * 60)
+```
+
+We can extract monitored data from the simulation using `get_mon_resources`. This allows us to see at different time points what each resource is doing.
+
+```{r class.source = 'fold-show'}
+resources <- get_mon_resources(env)
+head(resources)
+```
+
+`simmer.plot` allows us to quickly visualise the results of the simulation. For instance, we can explore the utilisation of each resource.
+
+```{r class.source = 'fold-show'}
+plot(resources, metric = "utilization")
+```
+
+We can also see this over time. The blue line reports the number of staff busy, and the red line reports the number of patients queuing and waiting to be served. We could also show a line by adding "system" to the items argument to show the total number queuing and being served. This shows that for this simulation nurses are quickly overwhelmed (their capacity varies because of the admin work they have to do after every patient).
+
+```{r class.source = 'fold-show'}
+plot(resources, metric = "usage", items = c("queue", "server"))
+```
+
+It can sometimes to be easier to see this using the steps argument.
+
+```{r class.source = 'fold-show'}
+plot(resources, metric = "usage", items = c("queue", "server"), steps = T)
+```
+
+Finally, we can explore the waiting times (time in activity and total time in the system are also able to be plotted using "activity_time" and "flow_time" respectively.)
+
+```{r class.source = 'fold-show'}
+plot(get_mon_arrivals(env), metric = "waiting_time")
+```
+
+We can also plot the trajectory itself which can be useful for communication.
+
+```{r class.source = 'fold-show'}
+plot(patient)
+```
+
+### Replication
+
+Because the time between patient arrivals and time to treat patients varies, in order to get a more accurate understanding of what may happen in real life, we must repeatedly run the model. Note replications can also be undertaken in parallel using \`mclapply'. For details see [here](https://r-simmer.org/articles/simmer-01-introduction.html#replication).
+
+```{r class.source = 'fold-show'}
+set.seed(42)
+
+# Create a simmer environment with the resources we have available and run this for 4 hours. Replicate the model 100 times.
+envs <- lapply(1:100, function(i) {
+  simmer("A&E Department") %>%
+    add_resource("receptionist", 1) %>%
+    add_resource("nurse", 2) %>%
+    add_resource("doctor", 2) %>%
+    add_generator("patient", patient, function() rexp(1, 1/5)) %>%
+    run(4 * 60)
+})
+```
+
+We can easily plot the results of these simulations for instance:
+
+```{r class.source = 'fold-show'}
+plot(get_mon_resources(envs), metric = "usage", items = "queue")
+plot(get_mon_arrivals(envs), metric = "waiting_time")
+```
+
+Here we can see that whilst we clearly need more capacity for nursing in some instances the wait time for receptionists can get very long. Using the simulations, a risk score could be calculated to indicate how likely a queue of a certain length is and whether reducing that risk is worth the cost of an addition receptionist.
+
+### Modelling change
+
+As we have seen our A&E department seems to have too few nurses to cope with the volume of patients. We can explore what happens if we increase the number of nurses to four.
+
+```{r class.source = 'fold-show'}
+set.seed(42)
+
+# Create a simmer environment with the resources we have available and run this for 4 hours. Replicate the model 100 times.
+envs <- lapply(1:100, function(i) {
+  simmer("A&E Department") %>%
+    add_resource("receptionist", 1) %>%
+    add_resource("nurse", 4) %>%
+    add_resource("doctor", 2) %>%
+    add_generator("patient", patient, function() rexp(1, 1/5)) %>%
+    run(4 * 60)
+})
+
+plot(get_mon_resources(envs), metric = "usage", items = c("server", "queue"))
+plot(get_mon_arrivals(envs), metric = "waiting_time")
+```
+
+We can see the bottleneck of nurses is removed in this case however the number of doctors means that overall waiting times barely change. Increase the number of doctors to three and reducing the number of nurses to three seems to minimise overall wait times (though once again we seem to create a shortfall of nurses).
+
+```{r class.source = 'fold-show'}
+set.seed(42)
+
+# Create a simmer environment with the resources we have available and run this for 4 hours. Replicate the model 100 times.
+envs <- lapply(1:100, function(i) {
+  simmer("A&E Department") %>%
+    add_resource("receptionist", 1) %>%
+    add_resource("nurse", 3) %>%
+    add_resource("doctor", 3) %>%
+    add_generator("patient", patient, function() rexp(1, 1/5)) %>%
+    run(4 * 60)
+})
+
+plot(get_mon_resources(envs), metric = "usage", items = c("server", "queue"))
+plot(get_mon_arrivals(envs), metric = "waiting_time")
+```
+
+Fuller guidance on DES modelling with simmer can be found here: <https://the-strategy-unit.github.io/des_simmer_workshop>. In the rest of this document, we will consider how to get simmer to optimise the model to improve efficiency.
+
+## Optimisation
+
+If we want to test how to maximise patient flow, we can use `simmer.optim` to iterate over a large number of models and assess what level of resource is optimal. Take the following:
+
+-   a maximization of the number of patients served before the 4-hour mark has been reached (\*\*objective\*\*)
+
+-   an employee budget of £2500 is available for the shift (\*\*constraint\*\*)
+
+    -   receptionist cost: £25 per hour
+
+    -   nurse cost: £50 per hour
+
+    -   doctor cost: £100 per hour
+
+-   a maximum average waiting time of 30 minutes is allowed (\*\*constraint\*\*)
+
+We want to test having anywhere between 1 and 4 of each resource (receptionist, nurse, doctor). To do this manually would require 64 runs of the model but with simmer.optim we can do it in one run.
+
+```{r class.source = 'fold-show', warning=FALSE}
+# remotes::install_github("r-simmer/simmer.optim")
+library(simmer.optim)
+
+# Create the model
+model <- function(){
+  patient <- trajectory("patients' path") %>%
+    visit("receptionist", function() rnorm(1, 5)) %>%
+    seize("nurse") %>%
+    timeout(function() rnorm(1, 15)) %>%
+    delayed_release("nurse", 5) %>% 
+    visit("doctor", function() rnorm(1, 25))
+
+  env <- simmer("A&E Department") %>%
+    add_resource("receptionist", .opt("nr_receptionists")) %>%
+    add_resource("nurse", .opt("nr_nurses")) %>%
+    add_resource("doctor", .opt("nr_doctors")) %>%
+    add_generator("patient", patient, function() rexp(1, 1/5))
+
+  env
+}
+
+# Create the constraints
+assert_within_budget <- function(envs, budget){
+  runtime_hrs <- msr_runtime(envs) / 60
+  number_receptionists <- msr_resource_capacity(envs, "receptionist")
+  number_nurses <- msr_resource_capacity(envs, "nurse")
+  number_doctors <- msr_resource_capacity(envs, "doctor")
+  
+  (number_receptionists * runtime_hrs * 25 +
+    number_nurses * runtime_hrs * 50 +
+    number_doctors * runtime_hrs * 100 ) <= budget
+}
+
+output <- simmer_optim(
+  model = model,
+  method = grid_optim,
+  direction = "max",
+  objective = msr_arrivals_finished,
+  constraints = list(with_args(assert_within_budget, budget = 2500),
+                     with_args(assert_avg_waiting_time_max, max_val = 30)),
+  params = list(nr_receptionists = par_discrete(1:4),
+                nr_nurses = par_discrete(1:4),
+                nr_doctors = par_discrete(1:4)),
+  control = optim_control(run_args = list(until = 4 * 60),
+                          replications = 20))
+
+output
+
+```
+
+We can plot the output of the simulation as before by referencing the envs object within the output list.
+
+```{r class.source = 'fold-show'}
+plot(get_mon_arrivals(output$envs), metric = "waiting_time")
+plot(get_mon_resources(output$envs), metric = "usage", items = c("server", "queue"))
+```
